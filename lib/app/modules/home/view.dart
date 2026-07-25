@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
@@ -7,47 +9,78 @@ import '../../data/models/vehicle_model.dart';
 import '../../utils/constants.dart';
 import 'controller.dart';
 
-class HomeView extends StatelessWidget {
+const double _kSheetMinFraction = 0.16;
+const double _kSheetInitialFraction = 0.32;
+const double _kSheetMaxFraction = 0.85;
+
+class HomeView extends StatefulWidget {
   const HomeView({super.key});
+
+  @override
+  State<HomeView> createState() => _HomeViewState();
+}
+
+class _HomeViewState extends State<HomeView> {
+  double _sheetFraction = _kSheetInitialFraction;
+  bool _isDragging = false;
+
+  void _onDragUpdate(DragUpdateDetails details, double screenHeight) {
+    setState(() {
+      _isDragging = true;
+      _sheetFraction -= details.delta.dy / screenHeight;
+      _sheetFraction = _sheetFraction.clamp(
+        _kSheetMinFraction,
+        _kSheetMaxFraction,
+      );
+    });
+  }
+
+  void _onDragEnd(DragEndDetails details) {
+    const stops = [
+      _kSheetMinFraction,
+      _kSheetInitialFraction,
+      _kSheetMaxFraction,
+    ];
+    final nearest = stops.reduce(
+      (a, b) => (_sheetFraction - a).abs() < (_sheetFraction - b).abs() ? a : b,
+    );
+    setState(() {
+      _isDragging = false;
+      _sheetFraction = nearest;
+    });
+  }
+
+  void _resetSheet() {
+    setState(() {
+      _isDragging = false;
+      _sheetFraction = _kSheetInitialFraction;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     final controller = Get.find<HomeController>();
+    final screenHeight = MediaQuery.of(context).size.height;
+    final sheetHeight = _sheetFraction * screenHeight;
 
     return Scaffold(
-      body: Stack(
+      body: Column(
         children: [
-          Obx(
-            () => GoogleMap(
-              initialCameraPosition: CameraPosition(
-                target: AppConstants.mockRoute.first,
-                zoom: 15,
-              ),
-              onMapCreated: controller.onMapCreated,
-              markers: {controller.vehicleMarker},
-              polylines: {controller.trailPolyline},
-              myLocationButtonEnabled: false,
-              zoomControlsEnabled: false,
-            ),
-          ),
-
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 12,
-            left: 16,
-            right: 16,
-            child: _SearchBar(onTap: () => _openSearchSheet(context)),
-          ),
-
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.end,
+          Expanded(
+            child: Stack(
               children: [
-                Padding(
-                  padding: const EdgeInsets.only(right: 16, bottom: 12),
+                const _AnimatedVehicleMap(),
+
+                Positioned(
+                  top: MediaQuery.of(context).padding.top + 12,
+                  left: 16,
+                  right: 16,
+                  child: _SearchBar(onTap: () => _openSearchSheet(context)),
+                ),
+
+                Positioned(
+                  right: 16,
+                  bottom: 12,
                   child: Obx(() {
                     final isOffline =
                         controller.vehicle.value?.status ==
@@ -76,6 +109,7 @@ class HomeView extends StatelessWidget {
                                 CameraUpdate.newLatLngZoom(v.position, 16),
                               );
                             }
+                            _resetSheet();
                           },
                           child: const Icon(Icons.my_location),
                         ),
@@ -83,8 +117,21 @@ class HomeView extends StatelessWidget {
                     );
                   }),
                 ),
-                const _VehicleBottomSheet(),
               ],
+            ),
+          ),
+
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onVerticalDragUpdate: (d) => _onDragUpdate(d, screenHeight),
+            onVerticalDragEnd: _onDragEnd,
+            child: AnimatedContainer(
+              duration: _isDragging
+                  ? Duration.zero
+                  : const Duration(milliseconds: 220),
+              curve: Curves.easeOut,
+              height: sheetHeight,
+              child: const _VehicleBottomSheet(),
             ),
           ),
         ],
@@ -101,6 +148,121 @@ class HomeView extends StatelessWidget {
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
     );
+  }
+}
+
+class _AnimatedVehicleMap extends StatefulWidget {
+  const _AnimatedVehicleMap();
+
+  @override
+  State<_AnimatedVehicleMap> createState() => _AnimatedVehicleMapState();
+}
+
+class _AnimatedVehicleMapState extends State<_AnimatedVehicleMap>
+    with SingleTickerProviderStateMixin {
+  final HomeController controller = Get.find<HomeController>();
+
+  late final AnimationController _animController;
+  Animation<double>? _latTween;
+  Animation<double>? _lngTween;
+
+  late LatLng _displayedPosition;
+  double _bearing = 0;
+  Worker? _vehicleWorker;
+
+  @override
+  void initState() {
+    super.initState();
+    _displayedPosition =
+        controller.vehicle.value?.position ?? AppConstants.mockRoute.first;
+
+    _animController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    )..addListener(_onTick);
+
+    _vehicleWorker = ever<VehicleModel?>(controller.vehicle, _onVehicleChanged);
+  }
+
+  void _onVehicleChanged(VehicleModel? model) {
+    if (model == null) return;
+    final from = _displayedPosition;
+    final to = model.position;
+
+    if (to.latitude != from.latitude || to.longitude != from.longitude) {
+      _bearing = _bearingBetween(from, to);
+    }
+
+    _latTween = Tween<double>(begin: from.latitude, end: to.latitude).animate(
+      CurvedAnimation(parent: _animController, curve: Curves.easeInOut),
+    );
+    _lngTween = Tween<double>(begin: from.longitude, end: to.longitude).animate(
+      CurvedAnimation(parent: _animController, curve: Curves.easeInOut),
+    );
+
+    _animController
+      ..reset()
+      ..forward();
+
+    controller.mapController?.animateCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(target: to, zoom: 16.5, bearing: _bearing, tilt: 35),
+      ),
+    );
+  }
+
+  void _onTick() {
+    if (_latTween == null || _lngTween == null) return;
+    setState(() {
+      _displayedPosition = LatLng(_latTween!.value, _lngTween!.value);
+    });
+  }
+
+  double _bearingBetween(LatLng start, LatLng end) {
+    final lat1 = start.latitude * (math.pi / 180);
+    final lat2 = end.latitude * (math.pi / 180);
+    final dLng = (end.longitude - start.longitude) * (math.pi / 180);
+    final y = math.sin(dLng) * math.cos(lat2);
+    final x =
+        math.cos(lat1) * math.sin(lat2) -
+        math.sin(lat1) * math.cos(lat2) * math.cos(dLng);
+    final bearing = math.atan2(y, x) * (180 / math.pi);
+    return (bearing + 360) % 360;
+  }
+
+  @override
+  void dispose() {
+    _vehicleWorker?.dispose();
+    _animController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Obx(() {
+      final baseMarker = controller.vehicleMarker;
+      return GoogleMap(
+        initialCameraPosition: CameraPosition(
+          target: AppConstants.mockRoute.first,
+          zoom: 16,
+        ),
+        onMapCreated: controller.onMapCreated,
+        markers: {
+          Marker(
+            markerId: const MarkerId('tracked_vehicle'),
+            position: _displayedPosition,
+            rotation: _bearing,
+            anchor: const Offset(0.5, 0.5),
+            flat: true,
+            icon: baseMarker.icon,
+            infoWindow: baseMarker.infoWindow,
+          ),
+        },
+        polylines: {controller.trailPolyline},
+        myLocationButtonEnabled: false,
+        zoomControlsEnabled: false,
+      );
+    });
   }
 }
 
@@ -272,11 +434,7 @@ class _VehicleBottomSheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final controller = Get.find<HomeController>();
-    final bottomInset = MediaQuery.of(context).padding.bottom;
-
     return Container(
-      padding: EdgeInsets.fromLTRB(20, 12, 20, 50 + bottomInset),
       decoration: const BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
@@ -289,96 +447,122 @@ class _VehicleBottomSheet extends StatelessWidget {
         ],
       ),
       child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Center(
-            child: Container(
-              width: 40,
-              height: 4,
-              margin: const EdgeInsets.only(bottom: 14),
-              decoration: BoxDecoration(
-                color: Colors.grey.shade300,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 10),
+            child: _DragHandle(),
           ),
-          Obx(() {
-            final v = controller.vehicle.value;
-            if (v == null) {
-              return const Padding(
-                padding: EdgeInsets.symmetric(vertical: 24),
-                child: Center(child: CircularProgressIndicator()),
-              );
-            }
-            return Row(
-              children: [
-                CircleAvatar(
-                  radius: 26,
-                  backgroundColor: _statusColor(v.status).withOpacity(0.15),
-                  child: Icon(
-                    Icons.local_shipping,
-                    color: _statusColor(v.status),
-                  ),
-                ),
-                const SizedBox(width: 14),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        v.driverName,
-                        style: const TextStyle(
-                          fontSize: 17,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        'Vehicle ID: ${v.id}',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey.shade600,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                _StatusChip(status: v.status),
-              ],
-            );
-          }),
-          const SizedBox(height: 18),
-          Obx(() {
-            final v = controller.vehicle.value;
-            return Row(
-              children: [
-                Expanded(
-                  child: _MetricTile(
-                    icon: Icons.speed,
-                    label: 'Speed',
-                    value: v == null ? '--' : '${v.speedKmph} km/h',
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _MetricTile(
-                    icon: Icons.access_time,
-                    label: 'Updated',
-                    value: v == null
-                        ? '--'
-                        : '${v.lastUpdated.hour.toString().padLeft(2, '0')}:'
-                              '${v.lastUpdated.minute.toString().padLeft(2, '0')}:'
-                              '${v.lastUpdated.second.toString().padLeft(2, '0')}',
-                  ),
-                ),
-              ],
-            );
-          }),
-          const Divider(height: 28),
-          const _EtaToggle(),
+          const Expanded(child: _VehicleBottomSheetBody()),
         ],
       ),
+    );
+  }
+}
+
+class _DragHandle extends StatelessWidget {
+  const _DragHandle();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Container(
+        width: 40,
+        height: 4,
+        decoration: BoxDecoration(
+          color: Colors.grey.shade300,
+          borderRadius: BorderRadius.circular(2),
+        ),
+      ),
+    );
+  }
+}
+
+class _VehicleBottomSheetBody extends StatelessWidget {
+  const _VehicleBottomSheetBody();
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = Get.find<HomeController>();
+    final bottomInset = MediaQuery.of(context).padding.bottom;
+
+    return ListView(
+      padding: EdgeInsets.fromLTRB(20, 4, 20, 16 + bottomInset),
+      children: [
+        Obx(() {
+          final v = controller.vehicle.value;
+          if (v == null) {
+            return const Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Center(child: CircularProgressIndicator()),
+            );
+          }
+          return Row(
+            children: [
+              CircleAvatar(
+                radius: 26,
+                backgroundColor: _statusColor(v.status).withOpacity(0.15),
+                child: Icon(
+                  Icons.local_shipping,
+                  color: _statusColor(v.status),
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      v.driverName,
+                      style: const TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Vehicle ID: ${v.id}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey.shade600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              _StatusChip(status: v.status),
+            ],
+          );
+        }),
+        const SizedBox(height: 18),
+        Obx(() {
+          final v = controller.vehicle.value;
+          return Row(
+            children: [
+              Expanded(
+                child: _MetricTile(
+                  icon: Icons.speed,
+                  label: 'Speed',
+                  value: v == null ? '--' : '${v.speedKmph} km/h',
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _MetricTile(
+                  icon: Icons.access_time,
+                  label: 'Updated',
+                  value: v == null
+                      ? '--'
+                      : '${v.lastUpdated.hour.toString().padLeft(2, '0')}:'
+                            '${v.lastUpdated.minute.toString().padLeft(2, '0')}:'
+                            '${v.lastUpdated.second.toString().padLeft(2, '0')}',
+                ),
+              ),
+            ],
+          );
+        }),
+        const Divider(height: 28),
+        const _EtaToggle(),
+      ],
     );
   }
 
